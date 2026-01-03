@@ -19,6 +19,7 @@ class InterviewSession(Base):
     # Candidate inputs
     resume_text = Column(Text, nullable=True)
     declared_weak_areas = Column(JSON, nullable=True)  # List of weak area strings
+    duration_minutes = Column(Integer, default=30)  # Session duration in minutes
 
     # Session state
     status = Column(String, default="active")  # active, completed, terminated

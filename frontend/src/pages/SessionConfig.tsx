@@ -4,6 +4,7 @@ import { createSession, uploadResume, SessionConfig as SessionConfigType } from 
 import PersonaSelector from '../components/PersonaSelector'
 import DepthSelector from '../components/DepthSelector'
 import DomainSelector from '../components/DomainSelector'
+import DurationSelector from '../components/DurationSelector'
 import ResumeUpload from '../components/ResumeUpload'
 import WeakAreaInput from '../components/WeakAreaInput'
 
@@ -17,6 +18,7 @@ export default function SessionConfig({ onLogout }: SessionConfigProps) {
   const [depthMode, setDepthMode] = useState('interview_ready')
   const [domains, setDomains] = useState<string[]>(['coding'])
   const [weakAreas, setWeakAreas] = useState<string[]>([])
+  const [durationMinutes, setDurationMinutes] = useState(30)
   const [resumeFile, setResumeFile] = useState<File | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -35,6 +37,7 @@ export default function SessionConfig({ onLogout }: SessionConfigProps) {
         depth_mode: depthMode,
         domains,
         declared_weak_areas: weakAreas.length > 0 ? weakAreas : undefined,
+        duration_minutes: durationMinutes,
       }
 
       const session = await createSession(config)
@@ -104,6 +107,15 @@ export default function SessionConfig({ onLogout }: SessionConfigProps) {
           <section>
             <h2 className="text-lg font-semibold text-gray-900 mb-4">Domains to Cover</h2>
             <DomainSelector selected={domains} onChange={setDomains} />
+          </section>
+
+          {/* Duration Selection */}
+          <section>
+            <h2 className="text-lg font-semibold text-gray-900 mb-4">Session Duration</h2>
+            <p className="text-sm text-gray-600 mb-3">
+              How long do you want to practice? The AI will pace questions accordingly.
+            </p>
+            <DurationSelector selected={durationMinutes} onChange={setDurationMinutes} />
           </section>
 
           {error && (

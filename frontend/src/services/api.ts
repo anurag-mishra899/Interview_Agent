@@ -43,6 +43,7 @@ export interface SessionConfig {
   depth_mode: string
   domains: string[]
   declared_weak_areas?: string[]
+  duration_minutes?: number  // 15, 30, 45, or 60 minutes
 }
 
 export async function createSession(config: SessionConfig) {

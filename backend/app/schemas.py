@@ -36,6 +36,7 @@ class SessionCreate(BaseModel):
     depth_mode: str  # surface, interview_ready, expert
     domains: List[str]  # coding, system_design, ml
     declared_weak_areas: Optional[List[str]] = None
+    duration_minutes: int = 30  # Session duration: 15, 30, 45, 60 minutes
 
 
 class SessionResponse(BaseModel):
@@ -48,6 +49,7 @@ class SessionResponse(BaseModel):
     started_at: datetime
     ended_at: Optional[datetime]
     declared_weak_areas: Optional[List[str]]
+    duration_minutes: int = 30
 
     class Config:
         from_attributes = True

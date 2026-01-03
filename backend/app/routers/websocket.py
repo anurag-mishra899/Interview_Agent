@@ -66,6 +66,7 @@ async def websocket_session(
         domains = session.domains
         declared_weak_areas = session.declared_weak_areas
         resume_text = session.resume_text
+        duration_minutes = session.duration_minutes or 30
 
     # Accept WebSocket connection
     await websocket.accept()
@@ -87,7 +88,8 @@ async def websocket_session(
         depth_mode=depth_mode,
         domains=domains,
         declared_weak_areas=declared_weak_areas or [],
-        resume_text=resume_text
+        resume_text=resume_text,
+        duration_minutes=duration_minutes
     )
 
     try:
@@ -108,6 +110,17 @@ async def websocket_session(
             return_when=asyncio.FIRST_COMPLETED
         )
 
+        # Retrieve exceptions from completed tasks to prevent "Task exception was never retrieved"
+        for task in done:
+            try:
+                task.result()
+            except WebSocketDisconnect:
+                pass  # Expected when client disconnects
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass  # Log if needed, but don't re-raise
+
         # Cancel pending tasks
         for task in pending:
             task.cancel()
@@ -115,14 +128,20 @@ async def websocket_session(
                 await task
             except asyncio.CancelledError:
                 pass
+            except WebSocketDisconnect:
+                pass
 
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        await websocket.send_json({
-            "type": "error",
-            "message": str(e)
-        })
+        # Try to send error, but client may have disconnected
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": str(e)
+            })
+        except Exception:
+            pass  # Client already disconnected
     finally:
         # Cleanup
         session_manager.set_connection_state(session_id, False)
@@ -204,9 +223,14 @@ async def handle_azure_messages(
                     "message": event.get("message", "Unknown error")
                 })
 
+    except WebSocketDisconnect:
+        raise
     except Exception as e:
-        await websocket.send_json({
-            "type": "error",
-            "message": str(e)
-        })
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": str(e)
+            })
+        except Exception:
+            pass  # Client already disconnected
         raise

@@ -55,13 +55,22 @@ async def create_session(
                 detail=f"Invalid domain '{domain}'. Must be one of: {valid_domains}"
             )
 
+    # Validate duration
+    valid_durations = [15, 30, 45, 60]
+    if session_data.duration_minutes not in valid_durations:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid duration. Must be one of: {valid_durations} minutes"
+        )
+
     # Create session in database
     interview_session = InterviewSession(
         user_id=current_user.id,
         persona=session_data.persona,
         depth_mode=session_data.depth_mode,
         domains=session_data.domains,
-        declared_weak_areas=session_data.declared_weak_areas
+        declared_weak_areas=session_data.declared_weak_areas,
+        duration_minutes=session_data.duration_minutes
     )
     db.add(interview_session)
     db.commit()
@@ -130,6 +139,13 @@ async def end_session(
             detail="Session is not active"
         )
 
+    # Save transcript before cleaning up in-memory state
+    transcript_summary = session_manager.get_transcript_summary(session_id)
+    if transcript_summary:
+        session.transcript_summary = transcript_summary
+        # Generate a basic report for terminated sessions
+        session.feedback_report = generate_terminated_session_report(session, transcript_summary)
+
     # Update session status
     session.status = "terminated"
     session.ended_at = datetime.utcnow()
@@ -139,3 +155,50 @@ async def end_session(
     session_manager.end_session(session_id)
 
     return None
+
+
+def generate_terminated_session_report(session: InterviewSession, transcript: str) -> str:
+    """Generate a basic report for a terminated session."""
+    duration = ""
+    if session.started_at:
+        elapsed = datetime.utcnow() - session.started_at
+        minutes = int(elapsed.total_seconds() // 60)
+        seconds = int(elapsed.total_seconds() % 60)
+        duration = f"{minutes}m {seconds}s"
+
+    return f"""# Interview Practice Session Report
+
+**Status:** Session Ended Early
+
+---
+
+## Session Summary
+
+| Metric | Value |
+|--------|-------|
+| **Persona** | {session.persona.title()} |
+| **Depth Mode** | {session.depth_mode.replace('_', ' ').title()} |
+| **Domains** | {', '.join(d.replace('_', ' ').title() for d in session.domains)} |
+| **Duration** | {duration} |
+| **Status** | Terminated |
+
+{f'''## Declared Weak Areas
+{chr(10).join('- ' + area for area in session.declared_weak_areas)}
+''' if session.declared_weak_areas else ''}
+
+## Conversation Transcript
+
+{transcript if transcript else '*No conversation recorded*'}
+
+---
+
+## Notes
+
+This session was ended before completion. For a full evaluation and detailed feedback:
+- Try to complete the full session
+- Practice more sessions to track improvement
+
+---
+
+*Report generated on {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}*
+"""

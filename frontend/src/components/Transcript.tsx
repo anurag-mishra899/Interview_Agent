@@ -23,7 +23,7 @@ export default function Transcript({ entries }: TranscriptProps) {
   return (
     <div
       ref={containerRef}
-      className="flex-1 overflow-y-auto p-4 space-y-4"
+      className="h-full overflow-y-auto p-4 space-y-4"
     >
       {entries.length === 0 ? (
         <p className="text-gray-500 text-center mt-8">

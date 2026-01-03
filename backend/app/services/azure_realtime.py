@@ -2,10 +2,12 @@ from typing import List, Optional, AsyncGenerator
 import asyncio
 import json
 import base64
+import logging
 
 from app.config import get_settings
 from app.personas import get_persona_prompt
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
@@ -23,7 +25,8 @@ class AzureRealtimeClient:
         depth_mode: str,
         domains: List[str],
         declared_weak_areas: List[str],
-        resume_text: Optional[str] = None
+        resume_text: Optional[str] = None,
+        duration_minutes: int = 30
     ):
         self.session_id = session_id
         self.persona = persona
@@ -31,15 +34,21 @@ class AzureRealtimeClient:
         self.domains = domains
         self.declared_weak_areas = declared_weak_areas
         self.resume_text = resume_text
+        self.duration_minutes = duration_minutes
 
         self._connection = None
         self._connected = False
         self._event_queue: asyncio.Queue = asyncio.Queue()
 
+        # Transcript accumulation
+        self._current_assistant_transcript = ""
+        self._current_user_transcript = ""
+
     async def connect(self):
         """Establish connection to Azure OpenAI Realtime API."""
         if not settings.azure_openai_endpoint or not settings.azure_openai_api_key:
             # Development mode - use mock responses
+            logger.info("No Azure credentials configured, using mock mode")
             self._connected = True
             asyncio.create_task(self._mock_interview())
             return
@@ -47,12 +56,13 @@ class AzureRealtimeClient:
         try:
             from openai import AsyncOpenAI
 
-            # Build WebSocket URL for Azure OpenAI
-            endpoint = settings.azure_openai_endpoint.replace("https://", "wss://")
-            base_url = f"{endpoint}/openai/realtime?api-version={settings.azure_openai_api_version}&deployment={settings.azure_openai_deployment}"
+            # Build WebSocket base URL for Azure OpenAI Realtime API
+            # Format: wss://<resource>.openai.azure.com/openai/v1
+            endpoint = settings.azure_openai_endpoint.rstrip("/")
+            websocket_base_url = endpoint.replace("https://", "wss://") + "/openai/v1"
 
             client = AsyncOpenAI(
-                base_url=base_url,
+                websocket_base_url=websocket_base_url,
                 api_key=settings.azure_openai_api_key
             )
 
@@ -61,41 +71,73 @@ class AzureRealtimeClient:
                 model=settings.azure_openai_deployment
             ).__aenter__()
 
-            # Configure session
+            # Configure session with new API format
             system_prompt = self._build_system_prompt()
             await self._connection.session.update(session={
+                "type": "realtime",
                 "instructions": system_prompt,
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {"model": "whisper-1"},
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": settings.silence_detection_ms
+                "output_modalities": ["audio"],
+                "audio": {
+                    "input": {
+                        "transcription": {
+                            "model": "whisper-1",
+                        },
+                        "format": {
+                            "type": "audio/pcm",
+                            "rate": 24000,
+                        },
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": settings.silence_detection_ms,
+                            "create_response": True,
+                        }
+                    },
+                    "output": {
+                        "voice": "alloy",
+                        "format": {
+                            "type": "audio/pcm",
+                            "rate": 24000,
+                        }
+                    }
                 },
-                "tools": [],
-                "voice": "alloy"
+                "tools": []
             })
 
             self._connected = True
+            logger.info("Connected to Azure Realtime API")
 
             # Start receiving events
             asyncio.create_task(self._receive_loop())
 
-        except ImportError:
+        except ImportError as e:
             # openai package not installed with realtime support
+            logger.info(f"OpenAI realtime not available ({e}), using mock mode")
+            self._connected = True
+            asyncio.create_task(self._mock_interview())
+        except AttributeError as e:
+            # realtime API not available in this version
+            logger.info(f"OpenAI realtime attribute error ({e}), using mock mode")
             self._connected = True
             asyncio.create_task(self._mock_interview())
         except Exception as e:
+            logger.error(f"Failed to connect to Azure Realtime: {e}")
             raise ConnectionError(f"Failed to connect to Azure Realtime: {e}")
 
     async def disconnect(self):
         """Close the connection."""
         self._connected = False
         if self._connection:
-            await self._connection.__aexit__(None, None, None)
-            self._connection = None
+            try:
+                # Try to close using the close() method if available
+                if hasattr(self._connection, 'close'):
+                    await self._connection.close()
+                # Otherwise, the connection will be cleaned up when dereferenced
+            except Exception as e:
+                logger.warning(f"Error closing connection: {e}")
+            finally:
+                self._connection = None
 
     async def send_audio(self, audio_data: bytes):
         """Send audio data to Azure."""
@@ -139,18 +181,54 @@ class AzureRealtimeClient:
         """Parse Azure Realtime event into our protocol."""
         event_type = event.type
 
-        if event_type == "response.audio.delta":
+        # New API uses response.output_audio.delta
+        if event_type == "response.output_audio.delta":
+            return {
+                "type": "audio",
+                "data": event.delta
+            }
+
+        # New API uses response.output_audio_transcript.delta - accumulate deltas
+        elif event_type == "response.output_audio_transcript.delta":
+            self._current_assistant_transcript += event.delta
+            # Don't send yet - wait for done event
+            return None
+
+        # Legacy event type support - accumulate deltas
+        elif event_type == "response.audio.delta":
             return {
                 "type": "audio",
                 "data": event.delta
             }
 
         elif event_type == "response.audio_transcript.delta":
-            return {
-                "type": "transcript",
-                "role": "assistant",
-                "text": event.delta
-            }
+            self._current_assistant_transcript += event.delta
+            # Don't send yet - wait for done event
+            return None
+
+        # Response transcript complete - send accumulated transcript
+        elif event_type == "response.output_audio_transcript.done":
+            if self._current_assistant_transcript:
+                result = {
+                    "type": "transcript",
+                    "role": "assistant",
+                    "text": self._current_assistant_transcript
+                }
+                self._current_assistant_transcript = ""
+                return result
+            return None
+
+        # Response done - send any remaining transcript
+        elif event_type == "response.done":
+            if self._current_assistant_transcript:
+                result = {
+                    "type": "transcript",
+                    "role": "assistant",
+                    "text": self._current_assistant_transcript
+                }
+                self._current_assistant_transcript = ""
+                return result
+            return None
 
         elif event_type == "conversation.item.input_audio_transcription.completed":
             return {
@@ -160,6 +238,8 @@ class AzureRealtimeClient:
             }
 
         elif event_type == "input_audio_buffer.speech_started":
+            # Clear any pending assistant transcript when user starts speaking
+            self._current_assistant_transcript = ""
             return {
                 "type": "turn_detection",
                 "is_speaking": True
@@ -184,6 +264,20 @@ class AzureRealtimeClient:
         # Get base persona prompt
         persona_prompt = get_persona_prompt(self.persona)
 
+        # Calculate question pacing based on duration
+        if self.duration_minutes <= 15:
+            question_count = "2-3"
+            pacing = "Keep answers brief. Move quickly between topics."
+        elif self.duration_minutes <= 30:
+            question_count = "4-6"
+            pacing = "Allow moderate depth on each topic before moving on."
+        elif self.duration_minutes <= 45:
+            question_count = "6-8"
+            pacing = "Take time for thorough exploration of each topic with follow-ups."
+        else:
+            question_count = "8-10"
+            pacing = "Deep dive into topics. Use extensive follow-up questions to fully probe understanding."
+
         # Add context about the session
         context_parts = [
             persona_prompt,
@@ -191,9 +285,23 @@ class AzureRealtimeClient:
             "## Session Context",
             f"Depth Mode: {self.depth_mode}",
             f"Domains to cover: {', '.join(self.domains)}",
+            "",
+            "## Time Management",
+            f"Session Duration: {self.duration_minutes} minutes",
+            f"Target Questions: {question_count} questions total",
+            f"Pacing Strategy: {pacing}",
+            "",
+            "IMPORTANT TIME AWARENESS:",
+            f"- You have {self.duration_minutes} minutes total for this interview",
+            f"- Plan to cover approximately {question_count} questions",
+            "- Pace yourself: don't rush early questions, but ensure you cover all planned domains",
+            "- If running low on time, prioritize wrapping up current topic over starting new ones",
+            "- Near the end (~5 minutes left), begin transitioning to closing",
+            "- Allow time for candidate questions if they have any",
         ]
 
         if self.declared_weak_areas:
+            context_parts.append("")
             context_parts.append(f"Candidate-declared weak areas: {', '.join(self.declared_weak_areas)}")
             context_parts.append("Prioritize probing these declared weak areas early in the session.")
 
